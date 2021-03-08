@@ -1,0 +1,238 @@
+/**
+ *  Sonos Speech Synthesis
+ *
+ *  Capabilities:
+ *      Speech Synthesis
+ */
+metadata {
+	definition (name: "Sonos Speech Synthesis", namespace: "getben", author: "BenTiedt") {
+		capability "Speech Synthesis"
+        capability "Switch"
+        
+        attribute "apiState", "enum", ["active", "authFailed"]
+
+		command "speak", ["string"]		
+	}
+
+	preferences {
+		input "authorizationCode", "string",
+			title: "Authorization Code:",
+			required: true,
+			displayDuringSetup: true
+       input "playerId", "string",
+			title: "Player Identifier:",
+			required: true,
+			displayDuringSetup: true
+       input "volume", "number",
+       		title: "Volume (0 - 100)",
+            required: false,
+            displayDuringSetup: true
+	}
+
+	tiles(scale: 2) {
+		standardTile("playChime", "device.switch", width: 2, height: 2) {
+			state "off", 
+				label:'Doorbell', 
+				action:"on",
+				icon:"st.Home.home30",
+				defaultState: true
+			state "on",
+				label:'Ringing',
+				action:"off",
+				icon:"st.Home.home30",
+				nextState: "off", 
+				backgroundColor: "#99c2ff"
+		}
+		main "playChime"
+		details(["playChime"])
+	}
+}
+
+def updated() {
+	// auth code may have changed in settings?.authorizationCode
+    log.debug "configure()"
+    
+    if (settings.authorizationCode != state.authorizationCode) {
+    	log.debug "updating authorization code"
+        state.authorizationCode = settings.authorizationCode
+        state.accessToken = ''
+        state.refreshToken = ''
+    	state.couldLoadToken = true
+	    refreshAccessToken()
+    }
+}
+
+def refreshAccessToken() {
+	log.debug "refreshing auth token. auth code: ${settings.authorizationCode}, refresh token: ${state.refreshToken}"
+	def expiresIn = 0
+    def error = ''
+    if (!state.couldLoadToken) {
+    	return
+    }
+
+	if (state.refreshToken != '') {
+    	// refresh the existing one
+        
+        def params = [
+            uri: "https://api.sonos.com/login/v3/oauth/access", 
+            headers: [
+                'Authorization': 'Basic ' // TODO: Requires authorization details for Sonos app
+            ],
+            body: "grant_type=refresh_token&refresh_token=${state.refreshToken}",
+            contentType: 'application/json',
+            requestContentType: 'application/x-www-form-urlencoded'
+        ]
+
+		try {
+            httpPost(params) { resp -> 
+                state.accessToken = resp.data.access_token
+                state.refreshToken = resp.data.refresh_token
+                expiresIn = resp.data.expires_in
+            }
+        } catch (e) {
+            state.accessToken = ''
+            state.refreshToken = ''
+            state.couldLoadToken = false
+            expiresIn = 0
+            error = $e
+		    log.debug "Couldn't refresh auth token: $e"
+		}
+    } else {
+    	// get a new token
+        def params = [
+            uri: "https://api.sonos.com/login/v3/oauth/access", 
+            headers: [
+                'Authorization': 'Basic ' // TODO: Requires authorization details for Sonos app
+            ],
+            body: "grant_type=authorization_code&code=${settings.authorizationCode}&redirect_uri=",  // TODO: Requires URL details for OAuth validation
+            contentType: 'application/json',
+            requestContentType: 'application/x-www-form-urlencoded'
+        ]
+		
+        try {
+            httpPost(params) { resp -> 
+                state.accessToken = resp.data.access_token
+                state.refreshToken = resp.data.refresh_token
+                expiresIn = resp.data.expires_in
+            }
+        } catch (e) {
+        	state.accessToken = ''
+            state.refreshToken = ''
+            state.couldLoadToken = false
+            expiresIn = 0
+            error = $e
+		    log.debug "Couldn't retrieve auth token: $e"
+		}
+    }
+    
+    if (!state.couldLoadToken) {
+    	def message = "Sonos authorization failed: ${error}"
+        sendEvent(name: "apiState", value: "authFailed", descriptionText: mesage, displayed: true)
+    } else {
+    	sendEvent(name: "apiState", value: "active", descriptionText: "Sonos authorization is active", displayed: true)
+    }
+    
+    if (state.couldLoadToken && expiresIn > 0) {
+    	expiresIn -= (30*60);
+        if (expiresIn < 60) {
+        	expiresIn = 60;
+        }
+    
+    	runIn(expiresIn, refreshAccessToken)
+    }
+}
+
+// Stops playing track and raises events switch.off, alarm.off, status.off
+def off() {
+	log.debug "Executing off()"
+    sendEvent(name: 'switch', value: 'off')
+}
+
+// Plays doorbellTrack and raises switch.on event
+def on() {
+	log.debug "Executing on()"
+    sendEvent(name: 'switch', value: 'on')
+	speak('CHIME')
+    sendEvent(name: 'switch', value: 'off')
+}
+
+def speak(message) {
+	if (state.accessToken == '') {
+    	refreshAccessToken()
+        if (state.accessToken == '') {
+        	return
+        } 
+    }
+
+	if (message == 'CHIME') {
+    	try {
+            log.debug('Chiming');
+            
+        	def volume = settings.volume;
+            if (volume == null || volume < 0 || volume > 100) {
+            	volume = 50
+            }
+        
+            def params = [
+            	uri: "https://api.ws.sonos.com/control/api/v1/players/${settings.playerId}/audioClip", 
+                headers: [
+                	'Authorization': "Bearer ${state.accessToken}"
+                ],
+                body: [
+                	"name": "Notification",
+                    "appId": "", // TODO: Requires APP ID details for Sonos app
+                    "clipType": "CUSTOM",
+  					        "priority": "HIGH",
+  					        "streamUrl": "", // TODO: URL for default chime
+                    "volume": volume
+                ],
+                contentType: 'application/json'
+            ]
+        
+            httpPostJson(params){ resp -> 
+            }
+        } catch (e) {
+            log.debug "Error sending chime notification to Sonos: $e"
+        }
+    } else {
+    	try {
+            log.debug("Saying ${message}");
+            def sound = textToSpeech(message)
+            playUri(sound.uri)
+        } catch (e) {
+            log.debug "Error retrieving custom text notification to Sonos: $e"
+        }
+	}
+}
+
+def playUri(uri) {
+	try {
+        log.debug("Playing URI ${uri}")
+        
+    	def volume = settings.volume;
+        if (volume == null || volume < 0 || volume > 100) {
+            volume = 50
+        }
+    
+        def params = [
+            uri: "https://api.ws.sonos.com/control/api/v1/players/${settings.playerId}/audioClip", 
+            headers: [
+                'Authorization': "Bearer ${state.accessToken}"
+            ],
+            body: [
+                "name": "Notification",
+                "appId": "",  // TODO: Requires APP ID details for Sonos app
+                "clipType": "CUSTOM",
+                "streamUrl": uri,
+                "priority": "HIGH",
+                "volume": volume
+            ],
+            contentType: 'application/json'
+        ]
+
+        httpPostJson(params) { resp -> 
+        }
+    } catch (e) {
+        log.debug "Error sending voice notification to Sonos: $e"
+    }
+}
